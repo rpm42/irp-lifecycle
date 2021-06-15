@@ -1,6 +1,7 @@
-import { Subject, of, BehaviorSubject } from 'rxjs'
-import { concatMap, delay, map, mergeMap, tap, withLatestFrom } from 'rxjs/operators'
+import { Subject, of, BehaviorSubject, throwError } from 'rxjs'
+import { catchError, concatMap, delay, map, mergeMap, tap, withLatestFrom } from 'rxjs/operators'
 import defer from 'lodash/defer'
+import { tryCatch } from 'rxjs/internal/util/tryCatch'
 
 type Completion = BehaviorSubject<number>
 
@@ -31,7 +32,12 @@ class Irp {
   //   return value.toPromise()
   // }
 
-  close = false
+  ok = true
+  errorMessage = ''
+  error(msg: string) {
+    this.ok = false
+    this.errorMessage = msg
+  }
 
   complete() {
     if (this.completionStack.length < 1) return
@@ -42,14 +48,15 @@ class Irp {
 }
 
 enum A {
-  ACTION_1 = 'ACTION_1',
-  ACTION_2 = 'ACTION_2'
+  ACTION_DO = 'ACTION_DO',
+  ACTION_OK = 'ACTION_OK',
+  ACTION_FAIL = 'ACTION_FAIL'
 }
 
 enum S {
-  STATE_1 = 'STATE_1',
-  STATE_2 = 'STATE_2',
-  STATE_3 = 'STATE_3'
+  INITIAL = 'INITIAL',
+  PENGING = 'PENGING',
+  READY = 'READY'
 }
 
 interface Action {
@@ -66,6 +73,21 @@ class Port {
       delay(5000),
       tap(irp => console.log('finish io operation'))
     )
+    return of(irp).pipe(
+      tap(irp => console.log('start io operation')),
+      delay(2000),
+      concatMap(irp => {
+        console.log('--- throwError ---')
+        return throwError(new Error('#### SOME EERROORR'))
+      }),
+      delay(2000),
+      tap(irp => console.log('finish io operation')),
+      catchError(e => {
+        console.log('catchError', e)
+        irp.error(e.message)
+        return of(irp)
+      })
+    )
   }
 
   irpIn$ = new Subject<Irp>()
@@ -78,7 +100,7 @@ class Port {
 }
 
 class Dispatcher {
-  state$ = new BehaviorSubject<S>(S.STATE_1)
+  state$ = new BehaviorSubject<S>(S.INITIAL)
   action$ = new Subject<Action>()
   irpNext$ = new Subject<Irp>()
   irpBack$ = new Subject<Irp>()
@@ -93,33 +115,44 @@ class Dispatcher {
     const irp = new Irp()
     const completion = irp.pushCompletion()
     console.log('syscall queue irp')
-    this.action$.next({ type: A.ACTION_1, data: irp })
+    this.action$.next({ type: A.ACTION_DO, data: irp })
     console.log('syscall waiting for irp')
     await completion
     console.log('complete syscall')
+    if (!irp.ok) throw new Error(irp.errorMessage)
+    return 'OK'
   }
 
   dispatch = (a: Action, s: S) => {
     console.log('>>> dispatch', a.type, s)
     switch (a.type) {
-      case A.ACTION_1:
+      case A.ACTION_DO:
         console.log('state 1')
         defer(async () => {
+          const irp = a.data
           console.log('enter defferedProcedureCall')
-          const completion = a.data.pushCompletion()
-          this.irpNext$.next(a.data)
+          const completion = irp.pushCompletion()
+          this.irpNext$.next(irp)
           console.log('start waiting...')
           await completion
           console.log('stop waiting... continue...')
-          this.action$.next({ type: A.ACTION_2, data: new Irp() })
+          if (irp.ok) {
+            this.action$.next({ type: A.ACTION_OK, data: new Irp() })
+          } else {
+            console.log('irp fail with msg', irp.errorMessage)
+            this.action$.next({ type: A.ACTION_FAIL, data: new Irp() })
+          }
           console.log('deffered end')
-          a.data.complete()
+          irp.complete()
         })
         console.log('post')
-        return S.STATE_2
-      case A.ACTION_2:
-        console.log('state 2')
-        return S.STATE_3
+        return S.PENGING
+      case A.ACTION_OK:
+        console.log('state ok')
+        return S.READY
+      case A.ACTION_FAIL:
+        console.log('state fail')
+        return S.READY
     }
     return this.state
   }
@@ -137,4 +170,14 @@ class Dispatcher {
 }
 
 const d = new Dispatcher()
-d.syscall()
+
+async function main() {
+  try {
+    await d.syscall()
+    console.log('OK')
+  } catch (e) {
+    console.error('ERROR', e.message)
+  }
+}
+
+main()
